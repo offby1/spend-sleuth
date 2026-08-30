@@ -34,7 +34,7 @@ you a report you can actually read.
 - **Where it went** — every transaction categorized, sorted by total, with bar charts
 - **Month by month** — a table of every category across every month you feed it
 - **Month-over-month changes** — *"Shopping roughly doubled — $79.83 → $148.75"*
-- **⚠️ Likely forgotten subscriptions** — fixed-price monthly charges that smell abandoned (the $39.99 gym you stopped going to)
+- **Likely forgotten subscriptions** — fixed-price monthly charges that smell abandoned (the $39.99 gym you stopped going to)
 - **Top 3 changes** — concrete suggestions with dollar amounts attached
 - Output as both `report.md` (read in your terminal) and `report.html` (open in a browser)
 
@@ -158,7 +158,7 @@ report.md  +  report.html
 ## How "likely forgotten" works
 
 `detect_recurring()` groups spending by normalized merchant and treats anything appearing
-in 2+ distinct months as recurring. It gets the ⚠️ flag when it's a **fixed-price,
+in 2+ distinct months as recurring. It gets the flag when it's a **fixed-price,
 exactly-once-a-month charge of $20+ in a subscription category** — the profile of a
 subscription running on autopilot. Groceries show up as recurring too, and that's
 correct; the flag is what points at the forgotten ones.
