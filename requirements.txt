@@ -1,0 +1,6 @@
+# Reads text out of statement PDFs
+pypdf>=4.0
+
+# Only needed to generate the sample statement PDF (make_sample_statement.py).
+# Not used when analyzing your own statements.
+reportlab>=4.0

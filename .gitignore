@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# NEVER commit financial data. Your statements and the reports generated from
+# them stay on your machine — that is the whole point of this tool.
+# ---------------------------------------------------------------------------
+*.csv
+*.pdf
+*.xls
+*.xlsx
+*.ofx
+*.qfx
+
+# Generated reports (they contain your real numbers)
+report.md
+report.html
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+.claude/
