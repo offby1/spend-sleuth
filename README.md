@@ -1,4 +1,4 @@
-# 🕵️ Spend Sleuth
+# Spend Sleuth
 
 **Point it at your bank statements. Find out where the money actually went — and which subscriptions you forgot you were paying for.**
 
