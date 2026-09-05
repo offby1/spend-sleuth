@@ -16,16 +16,13 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import json
+import os
 import re
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-
-try:
-    from pypdf import PdfReader
-except ImportError:
-    sys.exit("money_map needs pypdf to read PDFs:  python3 -m pip install pypdf")
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +92,10 @@ def load_pdf(pdf_path: str) -> list[Transaction]:
     balance. Adjust here if your bank's statement reads differently — e.g. if
     spending is printed as positive, flip the sign.
     """
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        sys.exit("money_map needs pypdf to read PDFs:  python3 -m pip install pypdf")
     reader = PdfReader(pdf_path)
     lines: list[str] = []
     for page in reader.pages:
@@ -391,16 +392,30 @@ def maybe_flip_signs(txns: list[Transaction]) -> bool:
     return False
 
 
-def categorize(txns: list[Transaction]) -> list[Transaction]:
+def categorize(txns: list[Transaction], extra_rules: dict[str, str] | None = None) -> list[Transaction]:
+    """extra_rules (e.g. loaded from --rules) are checked first, so they can
+    override or extend the built-in RULES table without editing this file."""
+    rules = {**(extra_rules or {}), **RULES}
     for t in txns:
         desc = t.description.upper()
-        for keyword, category in RULES.items():
+        for keyword, category in rules.items():
             if keyword in desc:
                 t.category = category
                 break
         else:
             t.category = "Income" if t.amount > 0 else "Uncategorized"
     return txns
+
+
+def load_rules_file(path: str) -> dict[str, str]:
+    """Load a keyword -> category JSON file, e.g. one downloaded from the
+    'Categorize' section of report.html. Keys are matched uppercase, same as
+    the RULES table."""
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        sys.exit(f"{path}: expected a JSON object of {{\"keyword\": \"category\"}}")
+    return {str(k).upper(): str(v) for k, v in data.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -496,49 +511,48 @@ def month_label(month: str) -> str:
     return datetime.strptime(month, "%Y-%m").strftime("%b %Y")
 
 
+def full_month_label(month: str) -> str:
+    return datetime.strptime(month, "%Y-%m").strftime("%B %Y")
+
+
+def date_range_label(months: list[str]) -> str:
+    """'November 2025 through September 2026' for a sorted list of 'YYYY-MM'
+    months (or just 'November 2025' when there's only one)."""
+    if not months:
+        return ""
+    if len(months) == 1:
+        return full_month_label(months[0])
+    return f"{full_month_label(months[0])} through {full_month_label(months[-1])}"
+
+
 def summarize_monthly(txns: list[Transaction]) -> dict[str, tuple]:
     """summarize() per calendar month, in chronological order."""
     return {m: summarize([t for t in txns if t.month == m])
             for m in sorted({t.month for t in txns})}
 
 
-def month_over_month(monthly: dict[str, tuple]) -> list[tuple[str, str, list[str]]]:
-    """For each consecutive month pair, the notable per-category changes,
-    biggest dollar swing first — 'Takeout & delivery roughly doubled'."""
-    notes = []
-    months = list(monthly)
-    for prev_m, cur_m in zip(months, months[1:]):
-        prev = dict(monthly[prev_m][2])
-        cur = dict(monthly[cur_m][2])
-        changes = []
-        for cat in set(prev) | set(cur):
-            p, c = prev.get(cat, 0.0), cur.get(cat, 0.0)
-            if abs(c - p) < 25:                      # ignore small swings
-                continue
-            if p == 0:
-                txt = f"{cat}: new this month at ${c:,.2f}"
-            elif c == 0:
-                txt = f"{cat}: dropped to $0 (was ${p:,.2f})"
-            else:
-                r = c / p
-                if r >= 2.5:
-                    word = f"{r:.1f}× last month"
-                elif r >= 1.8:
-                    word = "roughly doubled"
-                elif r >= 1.25:
-                    word = f"up {r - 1:.0%}"
-                elif r <= 0.55:
-                    word = "roughly halved" if r > 0.4 else f"down {1 - r:.0%}"
-                elif r <= 0.8:
-                    word = f"down {1 - r:.0%}"
-                else:
-                    continue                          # under ±25% — not notable
-                txt = f"{cat} {word} — ${p:,.2f} → ${c:,.2f}"
-            changes.append((abs(c - p), txt))
-        changes.sort(key=lambda x: -x[0])
-        notes.append((month_label(prev_m), month_label(cur_m),
-                      [t for _, t in changes[:6]]))
-    return notes
+@dataclass
+class UncategorizedGroup:
+    description: str
+    count: int
+    total: float        # sum of |amount| across the group
+    keyword: str         # suggested RULES keyword for this description
+
+
+def top_uncategorized(txns: list[Transaction], n: int = 12) -> list[UncategorizedGroup]:
+    """Group Uncategorized transactions by their exact description and sum
+    each group's amount, then keep the biggest groups — the ones most worth
+    giving a keyword rule, since together they move the needle most."""
+    by_desc: dict[str, list[Transaction]] = defaultdict(list)
+    for t in txns:
+        if t.category == "Uncategorized":
+            by_desc[t.description].append(t)
+    groups = [
+        UncategorizedGroup(desc, len(ts), sum(abs(t.amount) for t in ts), normalize_merchant(desc))
+        for desc, ts in by_desc.items()
+    ]
+    groups.sort(key=lambda g: -g.total)
+    return groups[:n]
 
 
 # ---------------------------------------------------------------------------
@@ -607,12 +621,13 @@ def monthly_table_rows(monthly):
 
 
 def write_markdown(path, source, income, spent, categories, recurring, advice,
-                   n_months, transfers=0.0, monthly=None, mom=None):
+                   n_months, transfers=0.0, monthly=None, uncategorized=None, date_range=""):
     max_val = categories[0][1] if categories else 1
+    span = f"{date_range} — " if date_range else ""
     lines = [
         "# Money Map",
         "",
-        f"Source: `{source}` — {n_months} month(s) of activity",
+        f"Source: `{source}` — {span}{n_months} month(s) of activity",
         "",
         f"**Income:** ${income:,.2f} · **Spent:** ${spent:,.2f} · "
         f"**Net:** {'+' if income >= spent else '-'}${abs(income - spent):,.2f}",
@@ -637,12 +652,16 @@ def write_markdown(path, source, income, spent, categories, recurring, advice,
                   "|---|" + "---:|" * (len(header) - 1)]
         lines += ["| " + " | ".join(r) + " |" for r in rows]
 
-    if mom:
-        lines += ["", "## Month-over-month changes", ""]
-        for prev_l, cur_l, items in mom:
-            lines.append(f"**{cur_l} vs {prev_l}:**")
-            lines += [f"- {it}" for it in items] or ["- no notable changes"]
-            lines.append("")
+    if uncategorized:
+        lines += ["", "## Biggest uncategorized transactions", "",
+                  "*Grouped by description, biggest total first. Add these merchants to the "
+                  "`RULES` table in `money_map.py` (or use the interactive Categorize section "
+                  "in report.html) to categorize them.*", "",
+                  "| Description | Count | Amount |",
+                  "|---|---:|---:|"]
+        for g in uncategorized:
+            desc = g.description.replace("|", "\\|")
+            lines.append(f"| {desc} | {g.count} | ${g.total:,.2f} |")
 
     lines += ["", "## Recurring charges", ""]
     for r in recurring:
@@ -660,8 +679,9 @@ def write_markdown(path, source, income, spent, categories, recurring, advice,
 
 
 def write_html(path, source, income, spent, categories, recurring, advice,
-               n_months, transfers=0.0, monthly=None, mom=None):
+               n_months, transfers=0.0, monthly=None, uncategorized=None, date_range=""):
     max_val = categories[0][1] if categories else 1
+    span = f"{date_range} — " if date_range else ""
 
     monthly_html = ""
     if monthly and len(monthly) > 1:
@@ -677,15 +697,102 @@ def write_html(path, source, income, spent, categories, recurring, advice,
                         f'<div class="scroll"><table><thead><tr>{head}</tr></thead>'
                         f'<tbody>{body}</tbody></table></div></div>')
 
-    mom_html = ""
-    if mom:
-        blocks = ""
-        for prev_l, cur_l, items in mom:
-            lis = "".join(f"<li>{html.escape(it)}</li>" for it in items) \
-                  or "<li>no notable changes</li>"
-            blocks += (f'<h3>{html.escape(cur_l)} vs {html.escape(prev_l)}</h3>'
-                       f'<ul>{lis}</ul>')
-        mom_html = f'<div class="card"><h2>Month-over-month changes</h2>{blocks}</div>'
+    uncategorized_html = ""
+    if uncategorized:
+        known_categories = sorted(({c for c, _ in categories} | set(RULES.values())) - {"Uncategorized"})
+        options = "".join(f'<option value="{html.escape(c)}">' for c in known_categories)
+        body_rows = "\n".join(
+            f'<tr>'
+            f'<td>{html.escape(g.description)}</td>'
+            f'<td class="val">{g.count}</td>'
+            f'<td class="val">${g.total:,.2f}</td>'
+            f'<td><input class="kw" value="{html.escape(g.keyword)}"></td>'
+            f'<td><input class="cat" list="known-categories" '
+            f'placeholder="e.g. Groceries"></td>'
+            f'</tr>'
+            for g in uncategorized
+        )
+        uncategorized_html = f"""<div class="card" id="categorize">
+    <h2>Biggest uncategorized transactions</h2>
+    <p class="sub">Grouped by description, biggest total first. Type a category for a row
+    (and adjust its keyword if needed) to build a rules file. Nothing leaves this page —
+    your entries are saved to this browser only, in this page's local storage.</p>
+    <datalist id="known-categories">{options}</datalist>
+    <div class="scroll"><table id="uncat-table">
+      <thead><tr><th>Description</th><th class="val">Count</th><th class="val">Amount</th>
+      <th>Keyword</th><th>Category</th></tr></thead>
+      <tbody>{body_rows}</tbody>
+    </table></div>
+    <div class="catbar">
+      <button id="download-rules" type="button">Download rules.json</button>
+      <span id="catcount" class="sub"></span>
+    </div>
+    <p class="sub">Then run: <code>python3 money_map.py {html.escape(source)} --rules rules.json</code>
+    and re-open the new report.</p>
+  </div>
+  <script>
+    (() => {{
+      const STORAGE_KEY = "moneyMapDraftRules:" + {json.dumps(source)};
+      const table = document.getElementById("uncat-table");
+      const countEl = document.getElementById("catcount");
+      let draft = {{}};
+      try {{ draft = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {{}}; }} catch (e) {{ draft = {{}}; }}
+
+      // Keyed by each row's Description cell (stable across re-runs), never by row
+      // position — the biggest-uncategorized list gets re-sorted every run, so a
+      // positional key would silently reattach an old entry to the wrong merchant.
+      for (const row of table.tBodies[0].rows) {{
+        const description = row.cells[0].textContent;
+        const saved = draft[description];
+        if (saved) {{
+          row.querySelector(".kw").value = saved.keyword;
+          row.querySelector(".cat").value = saved.category;
+        }}
+      }}
+
+      function save() {{
+        try {{ localStorage.setItem(STORAGE_KEY, JSON.stringify(draft)); }} catch (e) {{ /* ignore */ }}
+        const n = Object.keys(draft).filter(d => draft[d].category).length;
+        countEl.textContent = n ? `${{n}} categorized — not yet downloaded` : "";
+      }}
+
+      table.addEventListener("input", (e) => {{
+        const row = e.target.closest("tr");
+        if (!row) return;
+        const description = row.cells[0].textContent;
+        const keyword = row.querySelector(".kw").value.trim();
+        const category = row.querySelector(".cat").value.trim();
+        if (category) {{
+          draft[description] = {{ keyword, category }};
+        }} else {{
+          delete draft[description];
+        }}
+        save();
+      }});
+      save();
+
+      document.getElementById("download-rules").addEventListener("click", () => {{
+        const rules = {{}};
+        for (const description in draft) {{
+          const {{ keyword, category }} = draft[description];
+          if (keyword && category) rules[keyword.toUpperCase()] = category;
+        }}
+        if (Object.keys(rules).length === 0) {{
+          alert("Type a category for at least one row first.");
+          return;
+        }}
+        const blob = new Blob([JSON.stringify(rules, null, 2)], {{ type: "application/json" }});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "rules.json";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      }});
+    }})();
+  </script>"""
     transfer_note = (
         f'<p class="sub" style="flex-basis:100%">${transfers:,.2f} in card payments '
         f'excluded — transfers between your own accounts, not income or spending.</p>'
@@ -741,13 +848,23 @@ def write_html(path, source, income, spent, categories, recurring, advice,
   thead th {{ border-bottom:2px solid #d7dcea; }}
   tbody td {{ border-bottom:1px solid #edf0f7; font-variant-numeric:tabular-nums; }}
   tr.sumrow td {{ font-weight:700; background:#f3f5fa; }}
+  #uncat-table td:first-child {{ white-space:normal; }}
+  #uncat-table th.val, #uncat-table td.val {{ text-align:right; }}
+  #uncat-table input {{ width:100%; min-width:9rem; font:inherit; padding:.3rem .5rem;
+                         border:1px solid #d7dcea; border-radius:6px; }}
+  #uncat-table input.cat {{ min-width:11rem; }}
+  .catbar {{ display:flex; align-items:center; gap:1rem; margin-top:1rem; }}
+  button {{ font:inherit; font-weight:600; color:#fff; background:var(--accent); border:none;
+            border-radius:8px; padding:.55rem 1rem; cursor:pointer; }}
+  button:hover {{ filter:brightness(1.08); }}
+  code {{ background:#eef1f8; border-radius:4px; padding:.15rem .4rem; font-size:.85em; }}
 </style>
 </head>
 <body>
 <main>
   <div class="card">
     <h1>Money Map</h1>
-    <p class="sub">Source: {html.escape(source)} · {n_months} month(s) of activity</p>
+    <p class="sub">Source: {html.escape(source)} · {html.escape(span)}{n_months} month(s) of activity</p>
   </div>
   <div class="card totals">
     <div><div class="sub">Income</div><div class="num pos">${income:,.2f}</div></div>
@@ -757,7 +874,7 @@ def write_html(path, source, income, spent, categories, recurring, advice,
   </div>
   <div class="card"><h2>Where it went</h2>{cat_rows}</div>
   {monthly_html}
-  {mom_html}
+  {uncategorized_html}
   <div class="card"><h2>Recurring charges</h2><ul>{rec_rows}</ul></div>
   <div class="card"><h2>Top 3 changes</h2><ol>{advice_rows}</ol></div>
 </main>
@@ -780,7 +897,17 @@ def main():
                     help="force-flip signs (statement prints spending as positive)")
     ap.add_argument("--no-flip", action="store_true",
                     help="disable the automatic credit-card sign detection")
+    ap.add_argument("--rules", metavar="PATH",
+                    help="JSON file of extra {\"keyword\": \"category\"} rules, e.g. one "
+                         "downloaded from the Categorize section of report.html "
+                         "(defaults to money_map_rules.json in the current directory, if present)")
     args = ap.parse_args()
+
+    rules_path = args.rules or "money_map_rules.json"
+    extra_rules = {}
+    if args.rules or os.path.exists(rules_path):
+        extra_rules = load_rules_file(rules_path)
+        print(f"{rules_path}: loaded {len(extra_rules)} extra rule(s).")
 
     # Load each file separately: sign detection is per file (a credit-card
     # export and a checking statement have opposite conventions).
@@ -815,26 +942,32 @@ def main():
 
     txns = [Transaction(d, desc, amt) for (d, desc, amt), n in merged.items() for _ in range(n)]
     txns.sort(key=lambda t: t.date)
-    txns = categorize(txns)
+    txns = categorize(txns, extra_rules)
 
-    n_months = len({t.month for t in txns})
+    months = sorted({t.month for t in txns})
+    n_months = len(months)
+    date_range = date_range_label(months)
     income, spent, categories, transfers = summarize(txns)
     monthly = summarize_monthly(txns)
-    mom = month_over_month(monthly)
     recurring = detect_recurring(txns)
+    uncategorized = top_uncategorized(txns)
 
     advice = local_advice(income, spent, categories, recurring, n_months)
 
     source = ", ".join(args.statements)
     write_markdown("report.md", source, income, spent, categories,
-                   recurring, advice, n_months, transfers, monthly, mom)
+                   recurring, advice, n_months, transfers, monthly, uncategorized, date_range)
     write_html("report.html", source, income, spent, categories,
-               recurring, advice, n_months, transfers, monthly, mom)
+               recurring, advice, n_months, transfers, monthly, uncategorized, date_range)
 
     flagged = sum(r.likely_forgotten for r in recurring)
     print(f"{len(txns)} transactions from {len(per_file)} file(s) across {n_months} months")
     print(f"Income ${income:,.2f} | Spent ${spent:,.2f} | Net ${income - spent:+,.2f}")
     print(f"{len(recurring)} recurring merchants, {flagged} flagged as likely forgotten")
+    total_uncategorized = sum(1 for t in txns if t.category == "Uncategorized")
+    if total_uncategorized:
+        print(f"{total_uncategorized} uncategorized transaction(s) ({len(uncategorized)} shown "
+              "in the report) — categorize them right on the report.html page and download rules.json")
     print("Wrote report.md and report.html")
 
 

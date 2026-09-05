@@ -3,9 +3,8 @@
 **Point it at your bank statements. Find out where the money actually went — and which subscriptions you forgot you were paying for.**
 
 Drop in your statements (PDF *or* CSV, any number of them), run one command, and get a
-clean report: spending by category, a month-by-month breakdown, month-over-month
-changes like *"Takeout & delivery roughly doubled"*, and the recurring charges that
-look forgotten.
+clean report: spending by category, a month-by-month breakdown, the biggest
+transactions it couldn't categorize, and the recurring charges that look forgotten.
 
 **100% local. No API keys, no accounts, no network calls.** Your financial data never
 leaves your machine — not one byte.
@@ -33,7 +32,8 @@ you a report you can actually read.
 
 - **Where it went** — every transaction categorized, sorted by total, with bar charts
 - **Month by month** — a table of every category across every month you feed it
-- **Month-over-month changes** — *"Shopping roughly doubled — $79.83 → $148.75"*
+- **Biggest uncategorized transactions** — the ones most worth giving a keyword rule,
+  with an interactive categorizer right in `report.html` (see below)
 - **Likely forgotten subscriptions** — fixed-price monthly charges that smell abandoned (the $39.99 gym you stopped going to)
 - **Top 3 changes** — concrete suggestions with dollar amounts attached
 - Output as both `report.md` (read in your terminal) and `report.html` (open in a browser)
@@ -76,7 +76,7 @@ open report.html
 
 (on Linux use `xdg-open report.html`, on Windows just `report.html`)
 
-You'll see categories with bar charts, month-over-month changes, and two subscriptions
+You'll see categories with bar charts, a month-by-month table, and two subscriptions
 flagged ⚠️ **likely forgotten** — the gym and Adobe.
 
 ## Use it on your own statements
@@ -104,11 +104,31 @@ combine correctly in one report.
 |---|---|
 | `--flip` | Force-flip signs (your statement prints spending as positive) |
 | `--no-flip` | Disable the automatic credit-card sign detection |
+| `--rules PATH` | Load extra `{"keyword": "category"}` rules from a JSON file (see below). Defaults to `money_map_rules.json` in the current directory, if one exists |
 
 ## Tuning it to your bank
 
-The one thing you should expect to edit is the `RULES` dictionary in `money_map.py` — a
-plain `keyword → category` table:
+Your bank's merchant descriptions differ from anyone else's, so if a lot of spending
+lands in **Uncategorized**, teach it your merchants. There are two ways to do that:
+
+**1. Categorize interactively in the browser.** Open `report.html` — the "Biggest
+uncategorized transactions" section lists the ones most worth teaching it, each with an
+editable keyword and a category field (autocompletes from your existing categories).
+Type categories for as many as you like, click **Download rules.json**, then re-run:
+
+```bash
+python3 money_map.py my-statement.pdf --rules rules.json
+```
+
+Your entries are saved to that page's local storage as you type, so a reload won't lose
+them. Nothing leaves the page — the download happens entirely in your browser, even
+though `report.html` is opened as a local `file://` page with no server behind it.
+`--rules` merges the file's keywords in ahead of the built-in table, so they win on
+conflicts. Rename the downloaded file to `money_map_rules.json` in the directory you run
+`money_map.py` from and it'll be picked up automatically, no flag needed.
+
+**2. Edit the `RULES` dictionary** in `money_map.py` directly — a plain
+`keyword → category` table:
 
 ```python
 RULES = {
@@ -119,9 +139,8 @@ RULES = {
 }
 ```
 
-Your bank's merchant descriptions differ from anyone else's, so if a lot of spending
-lands in **Uncategorized**, add your merchants here. Order matters: the first matching
-keyword wins, so put specific keywords above generic ones (`UBER EATS` before `UBER`).
+Either way, order matters: the first matching keyword wins, so put specific keywords
+above generic ones (`UBER EATS` before `UBER`).
 
 ## How it works
 
@@ -130,9 +149,9 @@ statements (.pdf / .csv)
    ↓  detect file type from content, parse each file
 transactions
    ↓  auto-detect sign convention, merge + dedupe across files
-   ↓  categorize with local keyword rules
+   ↓  categorize with local keyword rules (built-in + optional --rules file)
    ↓  normalize merchants (STARBUCKS #5567 ≡ STARBUCKS #212) → detect recurring
-   ↓  summarize overall, per month, and month-over-month
+   ↓  summarize overall and per month
 report.md  +  report.html
 ```
 
@@ -177,7 +196,6 @@ risking a commit of your actual finances.
 - Detect a subscription's **price increase** over time (Netflix went up — by how much?)
 - Budgets: color a category red when it exceeds a target you set
 - Real pie/line charts in the HTML report
-- Merchant rules in a config file instead of in the source
 
 ## License
 
